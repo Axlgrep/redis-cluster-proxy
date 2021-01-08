@@ -548,6 +548,7 @@ int clusterNodeLoadInfo(redisCluster *cluster, clusterNode *node, list *friends,
             listAddNodeTail(friends, friend);
             continue;
         }
+        /* 不是myself就直接continue了, 所以这里的name, 一定是自身节点的 */
         if (name != NULL && node->name == NULL) node->name = sdsnew(name);
         node->is_replica = (strstr(flags, "slave") != NULL ||
                            (master_id != NULL && master_id[0] != '-'));
@@ -695,6 +696,8 @@ int fetchClusterConfiguration(redisCluster *cluster,
     listIter li;
     listNode *ln;
     listRewind(friends, &li);
+    /* friends链表不包含firstNode, 所以是将剩余节点都调用一遍
+     * clusterNodeLoadInfo */
     while ((ln = listNext(&li))) {
         clusterNode *friend = ln->value;
         success = clusterNodeLoadInfo(cluster, friend, NULL, NULL);

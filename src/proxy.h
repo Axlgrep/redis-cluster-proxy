@@ -50,40 +50,40 @@ typedef struct proxyThread {
     int thread_id;
     int io[2];
     pthread_t thread;
-    redisCluster *cluster;
-    aeEventLoop *loop;
+    redisCluster *cluster;   /* 每个thread都有自己的集群信息   */
+    aeEventLoop *loop;       /* 每个thread都有自己的event loop */
     list *clients;
     list *unlinked_clients;
-    list *pending_messages;
+    list *pending_messages;  /* 存放还没完全通过pipe发送给thread的消息 */
     list *connections_pool;
     int is_spawning_connections;
-    uint64_t next_client_id;
-    _Atomic uint64_t process_clients;
+    uint64_t next_client_id; /* 单调递增的一个客户端id, 溢出后会重置 */
+    _Atomic uint64_t process_clients;  /* 该线程上的client数量 */
     sds msgbuffer;
 } proxyThread;
 
 typedef struct clientRequest {
     struct client *client;
-    uint64_t id;
-    sds buffer;
-    int query_offset;
-    int is_multibulk;
-    int argc;
+    uint64_t id;                     /* 请求ID, 客户端接收到请求之后转发到后端Cache节点, 返回Reply并不一定是有序的, 需要依赖这个ID来进行排序, 返回给Client Reply */
+    sds buffer;                      /* 用于接收客户端请求的buffer */
+    int query_offset;                /* 当前已经解析的buffer偏移量 */
+    int is_multibulk;                /* 当前解析的命令是不是multibulk形式, 取值(-1, 0, 1) */
+    int argc;                        /* 当前请求的参数个数 */
     int num_commands;
-    long long pending_bulks;
-    long long current_bulk_length;
-    int *offsets;
-    int *lengths;
-    int offsets_size;
+    long long pending_bulks;         /* 当前解析的命令总共有多少bulk */
+    long long current_bulk_length;   /* 当前解析的bulk长度为多少 */
+    int *offsets;                    /* int array, 用于存储命令每个参数的距离buffer的起始偏移量 */
+    int *lengths;                    /* int array, 用于存储命令每个参数的长度 */
+    int offsets_size;                /* 实际上就是offsets/lengths数组的字节数, 默认值是 sizeof(int) * QUERY_OFFSETS_MIN_SIZE */
     int slot;
     clusterNode *node;
-    struct redisCommandDef *command;
-    size_t written;
+    struct redisCommandDef *command; /* 指向当前命令的redisCommandDef */
+    size_t written;                  /* buffer已经写到cluster的偏移量 */
     int parsing_status;
-    int has_write_handler;
+    int has_write_handler;           /* 如果该值为1, 表示当前请求还没有完整的写到Redis */
     int need_reprocessing;
     int parsed;
-    int owned_by_client;
+    int owned_by_client;             /* 应该是标记当前request是不是私有连接发送(锁定连接) */
     int closes_transaction;
     list *child_requests;
     rax  *child_replies;
@@ -92,7 +92,7 @@ typedef struct clientRequest {
     /* Pointers to *listNode used in various list. They allow to quickly
      * have a reference to the node instead of searching it via listSearchKey.
      */
-    listNode *requests_lnode; /* Pointer to node in client->requests list */
+    listNode *requests_lnode; /* Pointer to node in client->requests list, 指向当前clientRequest在client->requests链表中的位置 */
     listNode *requests_to_send_lnode; /* Pointer to node in
                                        * redisClusterConnection->
                                        *  requests_to_send list */
@@ -109,7 +109,7 @@ typedef struct {
     int tcp_backlog;
     char neterr[ANET_ERR_LEN];
     struct proxyThread **threads;
-    _Atomic uint64_t numclients;
+    _Atomic uint64_t numclients;   /* 当前连接client总数 */
     rax *commands;
     int min_reserved_fds;
     time_t start_time;
@@ -120,36 +120,41 @@ typedef struct {
 } redisClusterProxy;
 
 typedef struct client {
-    uint64_t id;
+    uint64_t id;                     /* 客户端id(每个线程会维护一个单调递增的client id) */
     int fd;
     sds ip;
     int port;
     sds addr;
-    int thread_id;
+    int thread_id;                   /* 所属线程id */
     sds obuf;
     size_t written;
     list *reply_array;
-    int status;
+    int status;                      /* 当前client的状态, 连接状态还是断开连接状态 */
     int has_write_handler;
     int flags;
-    uint64_t next_request_id;
+    uint64_t next_request_id;        /* client会为下一个请求分配ID, 赋值给clientRequest里面的id */
     struct clientRequest *current_request; /* Currently reading */
-    uint64_t min_reply_id;
+    uint64_t min_reply_id;           /* 在id为min_reply_id之前的clientRequest都是已经从Cache节点接收到Reply并且添加到自己的obuf里面的, 用这个变量来保证proxy有序的向client返回Reply */
     rax *unordered_replies;
     list *requests;                  /* All client's requests */
     list *requests_to_process;       /* Requests not completely parsed */
     int requests_with_write_handler; /* Number of request that are still
-                                      * being writing to cluster */
+                                      * being writing to cluster,
+                                      * 这里应该是记录当前还有多少个请求在共享连接上
+                                      * 待发送给cluster, 推测应该是在client断连之后,
+                                      * 根据这个值来判断什么时候才能释放client对象 */
     list *requests_to_reprocess;     /* Requestst to re-process after cluster
                                       * re-configuration completes */
     int pending_multiplex_requests;  /* Number of request that have to be
                                       * written/read before sending requests
-                                      * to private cluster connection */
+                                      * to private cluster connection,
+                                      * 实际上就是说在使用私有连接转发请求之前,
+                                      * 还有多少请求在共享连接(全局的)上还未处理完成*/
 
     redisCluster *cluster;
-    int multi_transaction;
-    clientRequest *multi_request;
-    clusterNode *multi_transaction_node;
+    int multi_transaction;           /* 客户端当前是否处于事务状态中 */
+    clientRequest *multi_request;    /* 指向multi命令的clientRequest */
+    clusterNode *multi_transaction_node; /* 如果对当前处于事务当中, 执行事务的目标Cache节点 */
     sds auth_user;                  /* Used by client who wants to authenticate
                                      * itself with different credentials from
                                      * the ones used in the proxy config */

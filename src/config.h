@@ -41,17 +41,17 @@
                                   "skipping entry point '%s'"
 
 typedef struct redisClusterEntryPoint {
-    char *host;
-    int port;
-    char *socket;
-    char *address;
+    char *host;     /* 127.0.0.1 */
+    int port;       /* 7000 */
+    char *socket;   /* 也可以直接采用Unix Socket进行通信 */
+    char *address;  /* 127.0.0.1:7000 */
 } redisClusterEntryPoint;
 
 typedef struct {
     int port;
     char *unixsocket;
     mode_t unixsocketperm;
-    int entry_points_count;
+    int entry_points_count;      /* 配置文件中配置的节点数量 */
     redisClusterEntryPoint entry_points[MAX_ENTRY_POINTS];
     int tcpkeepalive;
     int maxclients;

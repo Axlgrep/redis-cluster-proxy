@@ -2240,6 +2240,8 @@ static int recyclePrivateClusterConnection(client *c) {
         if (conn == NULL) goto fail;
         if (!conn->connected) goto fail;
         listRewind(conn->requests_to_send, &nli);
+        /* 只要有没有完整写入到Redis的请求, 或者有待接收Reply的请求,
+         * 那么当前集群连接无法复用 */
         while ((nln = listNext(&nli))) {
             clientRequest *req = listNodeValue(nln);
             if (req != NULL && req->has_write_handler) goto fail;
@@ -2620,7 +2622,9 @@ static int disableMultiplexingForClient(client *c) {
         if (pool_connections != NULL) {
             redisClusterConnection *poolconn = NULL;
             /* Try to find and remove the connection associated to the name
-             * of the node. */
+             * of the node.
+             * 这里是尝试从连接池中获取已经建立的连接供当前client私有的redisCluster
+             * 使用, 避免需要新建连之后才能转发client请求造成latency高的问题 */
             if (!raxRemove(pool_connections, (unsigned char*) source->name,
                  sdslen(source->name), (void **) &poolconn)) poolconn = NULL;
             if (poolconn && (!poolconn->connected || !poolconn->context)) {
@@ -2729,6 +2733,11 @@ static void closeClientPrivateConnection(client *c) {
     }
 }
 
+/* unlinkClient其实并不是释放Client对象, 只不过是将其从eventloop中将
+ * 其读写监听事件移除(当前客户端可能已经断开连接了, 但是有请求还在共
+ * 享连接上, 所以暂时没办法销毁Client对象), 然后如果当前Client有自己
+ * 维护的私有连接查看是否可以复用, 如果不能,需要将其释放(因为私有连接
+ * 可能是脏的, 不能继续复用). */
 static void unlinkClient(client *c) {
     if (c->status == CLIENT_STATUS_UNLINKED) return;
     proxyLogDebug("Unlink client %d:%" PRId64, c->thread_id, c->id);
@@ -2997,7 +3006,10 @@ static void writeToClusterHandler(aeEventLoop *el, int fd, void *privdata,
 static int writeToCluster(aeEventLoop *el, int fd, clientRequest *req) {
     /* If client disconnected and the request's target is on a private
      * connection owned bu the client itself, uninstall the write handler,
-     * free the request and stop proceeding. */
+     * free the request and stop proceeding.
+     * 如果client已经断开连接, 并且当前request是私有连接发送的, 那么释放当前
+     * request, 并且停止处理
+     * */
     if (req->client->status == CLIENT_STATUS_UNLINKED && req->owned_by_client) {
         if (req->has_write_handler) req->has_write_handler = 0;
         aeDeleteFileEvent(el, fd, AE_WRITABLE);
@@ -4094,6 +4106,9 @@ static int sendRequestToCluster(clientRequest *req, sds *errmsg)
     assert(req->node != NULL);
     redisCluster *cluster = getCluster(req->client);
     assert(cluster != NULL);
+    /* 如果当前redisCluster的owner不为NULL, 并且owner就是
+     * 请求所绑定的client, 说明该client目前是私有连接状态
+     * 发送请求 */
     if (cluster->owner && cluster->owner == req->client)
         req->owned_by_client = 1;
     aeEventLoop *el = getClientLoop(req->client);
@@ -4182,7 +4197,15 @@ static clientRequest *handleNextRequestsToCluster(clusterNode *node,
 
 /* Check whether a client with private connection (multiplexing disabled) still
  * has pending requests in the multiplexed context. After all pending requests
- * have been consumed, start sending requests to the private connection. */
+ * have been consumed, start sending requests to the private connection.
+ * 这里是在使用私有连接转发请求之前, 需要将该客户端在共享连接上的请求都消费完毕,
+ * 这是为了保证避免请求乱序造成数据错乱的问题, 考虑用户使用了pipeline的场景执行了
+ * 如下命令:
+ * set key value; multi; get key value; exec;
+ * set命令是可以在共享连接上进行转发的, 而事务相关命令需要使用私有连接, 如果在
+ * set命令在共享连接上没有执行成功之前, 私有连接直接去执行事务获取Key, 可能会获
+ * 取到空数据.
+ */
 static void checkForMultiplexingRequestsToBeConsumed(clientRequest *req) {
     if (req->client->cluster != NULL && !req->owned_by_client) {
         if (--req->client->pending_multiplex_requests <= 0) {
@@ -4235,6 +4258,8 @@ int processRequest(clientRequest *req, int *parsing_status,
             REQID_PRINTF_ARG(req));
     }
     if (next != NULL && req->requests_lnode != NULL) {
+        /* req->requests_lnode指向的是client->requests链表中当前req的位置
+         * listNextNode(req->requests_lnode)实际上就是当前req的下一个req */
         listNode *next_node = listNextNode(req->requests_lnode);
         if (next_node == NULL) *next = NULL;
         else *next = next_node->value;
@@ -4288,6 +4313,7 @@ int processRequest(clientRequest *req, int *parsing_status,
         if (command_name) sdsfree(command_name);
         return 1;
     }
+    /* 多key命令拆分逻辑还没看 */
     clusterNode *node = getRequestNode(req, &errmsg);
     if (node == NULL) {
         if (errmsg == NULL)
@@ -4300,7 +4326,10 @@ int processRequest(clientRequest *req, int *parsing_status,
      * we use the current request's node as the node for the whole transaction.
      * In this case we'll enqueue the client's MULTI request (multi_request),
      * after setting the node to it. The same node will be used for all queries
-     * under that transaction. */
+     * under that transaction.
+     *
+     * 当前client处于multi状态, 但是之前还没有找到执行事务的目标节点, 当前的命令
+     * 可以确认一个后端节点了, 所以我们将之前缓存的multi命令先发送到这个节点上 */
     if (req->client->multi_transaction) {
         clientRequest *multi_req = req->client->multi_request;
         if (multi_req != NULL) {
@@ -4310,7 +4339,11 @@ int processRequest(clientRequest *req, int *parsing_status,
                     goto invalid_request;
                 /* The client's min_reply_id must be also set to this first
                  * query inside the transaction, since the 'multi_request'
-                 * request reply will be skipped. */
+                 * request reply will be skipped.
+                 * client发送multi命令, 由于还没有确认执行事务的cache节点, 所以
+                 * proxy已经直接返回了OK, 在后续确认了执行事务的节点之后, proxy
+                 * 需要将之前缓存的multi命令转发到cache节点, 但是该命令的reply会
+                 * 被抛弃, 所以min_reply_id是multi后面第一个命令的id. */
                 req->client->min_reply_id = req->id;
             }
         }
